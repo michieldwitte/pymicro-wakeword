@@ -301,3 +301,57 @@ class MicroWakeWord:
         self._audio_buffer = self._audio_buffer[audio_buffer_idx:]
 
         return detected
+
+    def process_vad(self, audio_bytes: bytes, cutoff: int) -> bool:
+        """Process a chunk of audio in streaming mode.
+
+        Parameters
+        ----------
+        audio_bytes: bytes
+            Raw 16-bit mono audio samples at 16Khz
+
+        Returns the a value between 0-255 if voice activity was detected.
+        """
+
+        if not hasattr(self, "_voice_detected"):
+            self._voice_detected = False
+
+        self._audio_buffer += audio_bytes
+
+        # Process chunk
+        frontend_result = self._frontend.ProcessSamples(audio_bytes)
+
+        if not frontend_result.features:
+            # Not enough audio for a full window
+            return self._voice_detected
+
+        self._features.append(
+            np.array(frontend_result.features).reshape(
+                (1, 1, len(frontend_result.features))
+            )
+        )
+
+        if len(self._features) < _STRIDE:
+            # Not enough windows
+            return self._voice_detected
+
+        # quantize the input data
+        quant_features = (
+            np.concatenate(self._features, axis=1) / self.input_scale
+        ) + self.input_zero_point
+        quant_features = quant_features.astype(self.data_type)
+
+        # Stride instead of rolling
+        self._features.clear()
+
+        self.interpreter.set_tensor(self.input_details["index"], quant_features)
+        self.interpreter.invoke()
+        result = self.interpreter.get_tensor(self.output_details["index"])
+
+        if result:
+            if result[0][0] > cutoff:
+                self._voice_detected = True
+            else:
+                self._voice_detected = False
+
+        return self._voice_detected
