@@ -302,6 +302,7 @@ class MicroWakeWord:
 
         return detected
 
+
     def process_vad(self, audio_bytes: bytes, cutoff: int) -> bool:
         """Process a chunk of audio in streaming mode.
 
@@ -314,9 +315,7 @@ class MicroWakeWord:
         """
 
         if not hasattr(self, "_voice_detected"):
-            self._voice_detected = False
-
-        self._audio_buffer += audio_bytes
+            self._voice_detected = False   
 
         # Process chunk
         frontend_result = self._frontend.ProcessSamples(audio_bytes)
@@ -355,3 +354,97 @@ class MicroWakeWord:
                 self._voice_detected = False
 
         return self._voice_detected
+
+
+    def process_frontend(self, audio_bytes: bytes) -> bool:
+        """Process a chunk of audio in streaming mode.
+
+        Parameters
+        ----------
+        audio_bytes: bytes
+            Raw 16-bit mono audio samples at 16Khz
+
+        Returns True if the wake word was detected.
+        """
+        self._audio_buffer += audio_bytes
+
+        if len(self._audio_buffer) < _BYTES_PER_CHUNK:
+            # Not enough audio to get features
+            return None
+
+        frontend_results = []
+        audio_buffer_idx = 0
+        while (audio_buffer_idx + _BYTES_PER_CHUNK) <= len(self._audio_buffer):
+            # Process chunk
+            chunk_bytes = self._audio_buffer[
+                audio_buffer_idx : audio_buffer_idx + _BYTES_PER_CHUNK
+            ]
+            frontend_result = self._frontend.ProcessSamples(chunk_bytes)
+            frontend_results.append(frontend_result)
+            audio_buffer_idx += frontend_result.samples_read * _BYTES_PER_SAMPLE
+
+        # Remove processed audio
+        self._audio_buffer = self._audio_buffer[audio_buffer_idx:]
+
+        return frontend_results
+
+
+    def process_features(self, features) -> bool:
+        """Process a chunk of audio in streaming mode.
+
+        Parameters
+        ----------
+        audio_bytes: bytes
+            Raw 16-bit mono audio samples at 16Khz
+
+        Returns True if the wake word was detected.
+        """
+        detected = False
+        for frontend_result in features:
+            # Process chunk
+            self._ignore_seconds = max(0, self._ignore_seconds - _SECONDS_PER_CHUNK)
+
+            if not frontend_result.features:
+                # Not enough audio for a full window
+                continue
+
+            self._features.append(
+                np.array(frontend_result.features).reshape(
+                    (1, 1, len(frontend_result.features))
+                )
+            )
+
+            if len(self._features) < _STRIDE:
+                # Not enough windows
+                continue
+
+            # quantize the input data
+            quant_features = (
+                np.concatenate(self._features, axis=1) / self.input_scale
+            ) + self.input_zero_point
+            quant_features = quant_features.astype(self.data_type)
+
+            # Stride instead of rolling
+            self._features.clear()
+
+            self.interpreter.set_tensor(self.input_details["index"], quant_features)
+            self.interpreter.invoke()
+            result = self.interpreter.get_tensor(self.output_details["index"])
+
+            # dequantize output data
+            result = self.output_scale * (
+                result.astype(np.float32) - self.output_zero_point
+            )
+            self._probabilities.append(result.item())
+
+            if len(self._probabilities) < self.sliding_window_size:
+                # Not enough probabilities
+                continue
+
+            if statistics.mean(self._probabilities) > self.probability_cutoff:
+                if self._ignore_seconds <= 0:
+                    detected = True
+                    self._ignore_seconds = self.refractory_seconds
+
+
+        return detected
